@@ -1,7 +1,5 @@
 import { updateLoadingStatus } from '../ui/renderer.js';
 
-// Before we ask YouTube for data, we check our own cache first.
-// It's way faster if we already have what we're looking for.
 export async function getCachedData(key, collection = 'videos') {
     try {
         console.log(`[Cache] Checking cache for key: ${key.substring(0, 100)}... in collection: ${collection}`);
@@ -40,8 +38,6 @@ export async function getCachedData(key, collection = 'videos') {
     }
 }
 
-// Once we've fetched new data from YouTube, we store it in our cache.
-// This helps us avoid making the same request over and over.
 export async function cacheData(key, data, collection = 'videos') {
     try {
         if (!key || !data) {
@@ -51,7 +47,7 @@ export async function cacheData(key, data, collection = 'videos') {
         console.log(`[Cache] Storing data for key: ${key} in collection: ${collection}`);
         updateLoadingStatus('Saving to database...', true);
         
-        // Validate the data structure
+        // Validate data structure before caching
         const validatedData = {};
         if (Array.isArray(data.videos)) {
             validatedData.videos = data.videos;
@@ -62,12 +58,15 @@ export async function cacheData(key, data, collection = 'videos') {
         if (data.uploadsPlaylistId) {
             validatedData.uploadsPlaylistId = data.uploadsPlaylistId;
         }
+        if (data.categories && typeof data.categories === 'object') {
+            validatedData.categories = data.categories;
+        }
 
         if (Object.keys(validatedData).length === 0) {
             throw new Error('No valid data to cache');
         }
 
-        // Attempt to store with retries
+        // Retry logic with exponential backoff
         let attempts = 0;
         const maxAttempts = 3;
         let lastError = null;
@@ -98,14 +97,12 @@ export async function cacheData(key, data, collection = 'videos') {
                 lastError = error;
                 attempts++;
                 if (attempts < maxAttempts) {
-                    // Wait before retrying, with exponential backoff
                     await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempts) * 1000));
                     console.log(`[Cache] Retry attempt ${attempts}/${maxAttempts}`);
                 }
             }
         }
 
-        // If we get here, all attempts failed
         console.error('[Cache] All retry attempts failed:', lastError);
         updateLoadingStatus('Failed to save data.', false);
         throw lastError;
@@ -115,4 +112,4 @@ export async function cacheData(key, data, collection = 'videos') {
         updateLoadingStatus('Failed to save data.', false);
         throw error;
     }
-} 
+}

@@ -86,7 +86,7 @@ export async function getChannelDetails(channelId) {
         const channelData = await channelResponse.json();
         
         if (!channelResponse.ok) {
-            if (channelData.error?.message?.includes('quota')) throw new Error('quota exceeded');
+            if (channelData.error && channelData.error.message && channelData.error.message.includes('quota')) throw new Error('quota exceeded');
             throw new Error(channelData.error?.message || 'Failed to fetch channel details');
         }
 
@@ -136,7 +136,7 @@ export async function getChannelIdByHandle(channelHandle) {
         const detailsData = await detailsResponse.json();
 
         if (!detailsResponse.ok) {
-            if (detailsData.error?.message?.includes('quota')) throw new Error('quota exceeded');
+            if (detailsData.error && detailsData.error.message && detailsData.error.message.includes('quota')) throw new Error('quota exceeded');
             throw new Error('Could not retrieve channel details after resolving handle.');
         }
 
@@ -191,7 +191,7 @@ export async function loadPlaylistData(playlistId) {
             const data = await response.json();
 
             if (!response.ok) {
-                if (data.error?.message?.includes('quota')) throw new Error('quota exceeded');
+                if (data.error && data.error.message && data.error.message.includes('quota')) throw new Error('quota exceeded');
                 throw new Error(data.error?.message || 'Failed to fetch playlist items');
             }
 
@@ -206,7 +206,7 @@ export async function loadPlaylistData(playlistId) {
                 const statsResponse = await fetch(`https://www.googleapis.com/youtube/v3/videos?part=statistics,snippet,contentDetails,liveStreamingDetails,status&id=${videoIds}&key=${getCurrentApiKey()}`);
                 const statsData = await statsResponse.json();
                 if (!statsResponse.ok) {
-                    if (statsData.error?.message.includes('quota')) throw new Error('quota exceeded');
+                    if (statsData.error && statsData.error.message && statsData.error.message.includes('quota')) throw new Error('quota exceeded');
                 } else {
                      allVideos = allVideos.concat(statsData.items || []);
                 }
@@ -266,7 +266,7 @@ export async function loadChannelData(type) {
             const data = await response.json();
 
             if (!response.ok) {
-                if (data.error?.message?.includes('quota')) throw new Error('quota exceeded');
+                if (data.error && data.error.message && data.error.message.includes('quota')) throw new Error('quota exceeded');
                 throw new Error(data.error?.message || response.statusText);
             }
 
@@ -282,7 +282,7 @@ export async function loadChannelData(type) {
                 const detailsData = await detailsResponse.json();
 
                 if (!detailsResponse.ok) {
-                     if (detailsData.error?.message?.includes('quota')) throw new Error('quota exceeded');
+                     if (detailsData.error && detailsData.error.message && detailsData.error.message.includes('quota')) throw new Error('quota exceeded');
                 } else if (detailsData.items) {
                     const filtered = detailsData.items.filter(videoItem => {
                         const isVideoStream = isStreamVideo(videoItem);
@@ -295,7 +295,9 @@ export async function loadChannelData(type) {
         } while (nextPageToken);
 
         if (allVideos.length === 0) {
-            alert(`No ${type === 'streams' ? 'streams' : 'videos'} found for this channel`);
+            if (window.toast) {
+                window.toast.info(`No ${type === 'streams' ? 'streams' : 'videos'} found for this channel`);
+            }
             updateLoadingStatus(null);
         } else {
              setVideos(allVideos.map(normalizeVideoObject));

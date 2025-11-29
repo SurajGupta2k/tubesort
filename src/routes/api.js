@@ -1,13 +1,31 @@
 import express from 'express';
 import { MongoClient } from 'mongodb';
-import { DB_CONFIG } from '../../public/js/config.js';
 import dotenv from 'dotenv';
 import https from 'https';
 
-
 dotenv.config();
 
+// Database configuration - backend version
+const DB_CONFIG = {
+    dbName: 'ytweb',
+    collections: {
+        channels: 'channels',
+        videos: 'videos',
+        categories: 'categories',
+        playlists: 'playlists'
+    },
+    cacheExpiry: {
+        channels: 24,    // hours
+        videos: 12,      // hours
+        categories: 48,  // hours
+        playlists: 24   // hours
+    }
+};
+
 const router = express.Router();
+
+// Mutex for thread-safe key rotation
+let keyRotationLock = false;
 
 // We have a bunch of YouTube API keys to avoid hitting our daily limits.
 // This section handles automatically switching to a fresh key when one has been used too much.
@@ -19,14 +37,23 @@ const keyUsageTracking = {
     }
 };
 
-function initializeKeyTracking() {
-    const youtubeApiKeys = [
+// Helper to get all YouTube API keys
+function getYouTubeApiKeys() {
+    return [
         process.env.YOUTUBE_API_KEY_1,
         process.env.YOUTUBE_API_KEY_2,
         process.env.YOUTUBE_API_KEY_3,
         process.env.YOUTUBE_API_KEY_4,
         process.env.YOUTUBE_API_KEY_5
     ].filter(Boolean);
+}
+
+function initializeKeyTracking() {
+    const youtubeApiKeys = getYouTubeApiKeys();
+
+    if (youtubeApiKeys.length === 0) {
+        console.error('WARNING: No YouTube API keys configured!');
+    }
 
     youtubeApiKeys.forEach((key, index) => {
         keyUsageTracking.youtube.quotaResets.set(index, new Date());
@@ -34,26 +61,36 @@ function initializeKeyTracking() {
     });
 }
 
-function rotateYoutubeKey() {
-    const youtubeApiKeys = [
-        process.env.YOUTUBE_API_KEY_1,
-        process.env.YOUTUBE_API_KEY_2,
-        process.env.YOUTUBE_API_KEY_3,
-        process.env.YOUTUBE_API_KEY_4,
-        process.env.YOUTUBE_API_KEY_5
-    ].filter(Boolean);
-
-    keyUsageTracking.youtube.currentKeyIndex = 
-        (keyUsageTracking.youtube.currentKeyIndex + 1) % youtubeApiKeys.length;
-    
-    const lastReset = keyUsageTracking.youtube.quotaResets.get(keyUsageTracking.youtube.currentKeyIndex);
-    const now = new Date();
-    if (lastReset && (now - lastReset) >= 24 * 60 * 60 * 1000) {
-        keyUsageTracking.youtube.usageCount.set(keyUsageTracking.youtube.currentKeyIndex, 0);
-        keyUsageTracking.youtube.quotaResets.set(keyUsageTracking.youtube.currentKeyIndex, now);
+async function rotateYoutubeKey() {
+    // Thread-safe key rotation with mutex
+    while (keyRotationLock) {
+        await new Promise(resolve => setTimeout(resolve, 10));
     }
+    
+    keyRotationLock = true;
+    
+    try {
+        const youtubeApiKeys = getYouTubeApiKeys();
+        
+        if (youtubeApiKeys.length === 0) {
+            throw new Error('No YouTube API keys available');
+        }
 
-    return youtubeApiKeys[keyUsageTracking.youtube.currentKeyIndex];
+        keyUsageTracking.youtube.currentKeyIndex = 
+            (keyUsageTracking.youtube.currentKeyIndex + 1) % youtubeApiKeys.length;
+        
+        const lastReset = keyUsageTracking.youtube.quotaResets.get(keyUsageTracking.youtube.currentKeyIndex);
+        const now = new Date();
+        if (lastReset && (now - lastReset) >= 24 * 60 * 60 * 1000) {
+            keyUsageTracking.youtube.usageCount.set(keyUsageTracking.youtube.currentKeyIndex, 0);
+            keyUsageTracking.youtube.quotaResets.set(keyUsageTracking.youtube.currentKeyIndex, now);
+        }
+
+        console.log(`[KEY ROTATION] Switched to key index ${keyUsageTracking.youtube.currentKeyIndex}`);
+        return youtubeApiKeys[keyUsageTracking.youtube.currentKeyIndex];
+    } finally {
+        keyRotationLock = false;
+    }
 }
 
 initializeKeyTracking();
@@ -89,6 +126,9 @@ async function connectToDatabase() {
                 // Test the connection
                 await db.command({ ping: 1 });
                 console.log('Successfully connected to MongoDB and database is ready.');
+                
+                // Create indexes for performance
+                await createIndexes();
                 resolve();
             } catch (error) {
                 console.error('Failed to connect to MongoDB:', error);
@@ -107,6 +147,42 @@ async function connectToDatabase() {
     }
 }
 
+// Create database indexes for optimal performance
+async function createIndexes() {
+    try {
+        const collections = Object.values(DB_CONFIG.collections);
+        
+        for (const collectionName of collections) {
+            const collection = db.collection(collectionName);
+            
+            // Index on key for fast lookups
+            await collection.createIndex({ key: 1 }, { unique: true });
+            
+            // Index on expiresAt for efficient cleanup
+            await collection.createIndex({ expiresAt: 1 });
+            
+            // Compound index for common queries
+            await collection.createIndex({ key: 1, expiresAt: 1 });
+        }
+        
+        console.log('[DB] Indexes created successfully');
+    } catch (error) {
+        console.error('[DB] Error creating indexes:', error);
+    }
+}
+
+// Graceful shutdown handler - closes database connection
+export async function closeDatabase() {
+    if (client) {
+        try {
+            await client.close();
+            console.log('[DB] MongoDB connection closed gracefully');
+        } catch (error) {
+            console.error('[DB] Error closing MongoDB connection:', error);
+        }
+    }
+}
+
 // Ensure database connection
 async function ensureConnection() {
     if (!db) {
@@ -122,11 +198,6 @@ async function ensureConnection() {
         await connectToDatabase();
     }
 }
-
-// Connect to the DB when the server starts
-connectToDatabase().catch(error => {
-    console.error('Initial database connection failed:', error);
-});
 
 // This is a helper that runs before our cache-related routes.
 // It figures out which database collection to use based on the request
@@ -178,17 +249,22 @@ router.get('/cache', getCacheMiddleware, async (req, res) => {
             return res.status(400).json({ error: 'Key is required' });
         }
 
-        const data = await req.dbCollection.findOne({ key });
+        // Use atomic findOneAndDelete for expired cache to prevent race conditions
+        const now = new Date();
+        const data = await req.dbCollection.findOne({ 
+            key,
+            $or: [
+                { expiresAt: { $exists: false } },
+                { expiresAt: { $gt: now } }
+            ]
+        });
+        
         console.log('[API] Found data:', data ? 'yes' : 'no');
 
         if (!data) {
+            // Clean up any expired entry
+            await req.dbCollection.deleteOne({ key, expiresAt: { $lt: now } });
             return res.status(404).json({ error: 'Cache not found' });
-        }
-
-        if (data.expiresAt && new Date() > new Date(data.expiresAt)) {
-            console.log('[API] Cache expired, deleting...');
-            await req.dbCollection.deleteOne({ key });
-            return res.status(404).json({ error: 'Cache expired' });
         }
 
         res.json({ data });
@@ -207,22 +283,36 @@ router.post('/cache/get', getCacheMiddleware, async (req, res) => {
             return res.status(400).json({ error: 'Key is required' });
         }
 
-        const doc = await req.dbCollection.findOne({ key });
+        // Use atomic query to prevent race conditions
+        const now = new Date();
+        const doc = await req.dbCollection.findOne({ 
+            key,
+            $or: [
+                { expiresAt: { $exists: false } },
+                { expiresAt: { $gt: now } }
+            ]
+        });
 
         if (!doc) {
+            console.log('[API] ❌ Cache MISS:', key.substring(0, 50));
+            // Clean up any expired entry
+            await req.dbCollection.deleteOne({ key, expiresAt: { $lt: now } });
             return res.status(404).json({ error: 'Cache not found' });
         }
 
-        if (doc.expiresAt && new Date() > new Date(doc.expiresAt)) {
-            await req.dbCollection.deleteOne({ key });
-            return res.status(404).json({ error: 'Cache expired' });
-        }
+        console.log('[API] ✅ Cache HIT:', {
+            key: key.substring(0, 50),
+            hasVideos: !!doc.videos,
+            videoCount: doc.videos?.length || 0,
+            expiresAt: doc.expiresAt
+        });
 
         // We only want to return the actual cached data, not the whole document.
         const dataToReturn = {};
         if (doc.videos) dataToReturn.videos = doc.videos;
         if (doc.channelId) dataToReturn.channelId = doc.channelId;
         if (doc.uploadsPlaylistId) dataToReturn.uploadsPlaylistId = doc.uploadsPlaylistId;
+        if (doc.categories) dataToReturn.categories = doc.categories;
 
         res.json({ data: dataToReturn });
     } catch (error) {
@@ -239,11 +329,25 @@ router.post('/cache', cacheMiddleware, async (req, res) => {
             return res.status(400).json({ error: 'Key, data, and collection are required' });
         }
 
+        // Validate data size to prevent DoS
+        const dataSize = JSON.stringify(data).length;
+        const MAX_DATA_SIZE = 10 * 1024 * 1024; // 10MB limit
+        
+        if (dataSize > MAX_DATA_SIZE) {
+            return res.status(413).json({ 
+                error: 'Payload too large',
+                maxSize: '10MB',
+                actualSize: `${(dataSize / 1024 / 1024).toFixed(2)}MB`
+            });
+        }
+        
         // Log the request but sanitize potentially large data
         console.log('[API] Store cache request:', {
-            key,
+            key: key.substring(0, 100),
             collection,
-            dataSize: data ? JSON.stringify(data).length : 0
+            dataSize: `${(dataSize / 1024).toFixed(2)}KB`,
+            hasVideos: !!data.videos,
+            videoCount: data.videos?.length || 0
         });
 
         const expiryHours = DB_CONFIG.cacheExpiry[collection] || 24;
@@ -263,6 +367,7 @@ router.post('/cache', cacheMiddleware, async (req, res) => {
         if (data.videos) cacheDoc.videos = data.videos;
         if (data.channelId) cacheDoc.channelId = data.channelId;
         if (data.uploadsPlaylistId) cacheDoc.uploadsPlaylistId = data.uploadsPlaylistId;
+        if (data.categories) cacheDoc.categories = data.categories;
 
         // Attempt to store with retries
         let attempts = 0;
@@ -392,17 +497,10 @@ router.get('/cache/status', async (req, res) => {
     }
 });
 
-// This is the main endpoint our front-end uses to get the API keys it needs.
-// It gives out the current YouTube key and automatically rotates to the next one
-// if the current one is getting close to its usage limit.
+// Config endpoint - sends API keys to frontend
+// NOTE: Keys are visible in browser but restricted by domain in Google Cloud Console
 router.get('/config', (req, res) => {
-    const youtubeApiKeys = [
-        process.env.YOUTUBE_API_KEY_1,
-        process.env.YOUTUBE_API_KEY_2,
-        process.env.YOUTUBE_API_KEY_3,
-        process.env.YOUTUBE_API_KEY_4,
-        process.env.YOUTUBE_API_KEY_5
-    ].filter(Boolean);
+    const youtubeApiKeys = getYouTubeApiKeys();
 
     if (youtubeApiKeys.length === 0) {
         console.error('No YouTube API keys found in environment variables');
@@ -416,42 +514,29 @@ router.get('/config', (req, res) => {
 
     const currentKey = youtubeApiKeys[keyUsageTracking.youtube.currentKeyIndex];
     
-    const currentUsage = keyUsageTracking.youtube.usageCount.get(keyUsageTracking.youtube.currentKeyIndex) || 0;
-    keyUsageTracking.youtube.usageCount.set(keyUsageTracking.youtube.currentKeyIndex, currentUsage + 1);
-
-    if (currentUsage >= 100) {
-        const newKey = rotateYoutubeKey();
-        console.log(`Rotating YouTube API key due to high usage. New key index: ${keyUsageTracking.youtube.currentKeyIndex}`);
-        res.json({
-            youtubeApiKeys: [newKey, ...youtubeApiKeys.filter(k => k !== newKey)],
-            geminiApiKey: process.env.GEMINI_API_KEY,
-            keyRotated: true
-        });
-    } else {
-        res.json({
-            youtubeApiKeys: [currentKey, ...youtubeApiKeys.filter(k => k !== currentKey)],
-            geminiApiKey: process.env.GEMINI_API_KEY,
-            keyRotated: false
-        });
-    }
+    res.json({
+        youtubeApiKeys: [currentKey, ...youtubeApiKeys.filter(k => k !== currentKey)],
+        geminiApiKey: process.env.GEMINI_API_KEY,
+        keyRotated: false
+    });
 });
 
 // Some extra routes for managing and checking on our API keys.
-router.post('/rotate-key', (req, res) => {
-    const newKey = rotateYoutubeKey();
-    const youtubeApiKeys = [
-        process.env.YOUTUBE_API_KEY_1,
-        process.env.YOUTUBE_API_KEY_2,
-        process.env.YOUTUBE_API_KEY_3,
-        process.env.YOUTUBE_API_KEY_4,
-        process.env.YOUTUBE_API_KEY_5
-    ].filter(Boolean);
+router.post('/rotate-key', async (req, res) => {
+    try {
+        const newKey = await rotateYoutubeKey();
+        const youtubeApiKeys = getYouTubeApiKeys();
 
-    res.json({
-        youtubeApiKeys: [newKey, ...youtubeApiKeys.filter(k => k !== newKey)],
-        currentKeyIndex: keyUsageTracking.youtube.currentKeyIndex,
-        keyRotated: true
-    });
+        res.json({
+            youtubeApiKeys: [newKey, ...youtubeApiKeys.filter(k => k !== newKey)],
+            currentKeyIndex: keyUsageTracking.youtube.currentKeyIndex,
+            availableKeys: youtubeApiKeys.length,
+            keyRotated: true
+        });
+    } catch (error) {
+        console.error('[API] Key rotation error:', error);
+        res.status(500).json({ error: 'Failed to rotate key', details: error.message });
+    }
 });
 
 router.get('/key-usage', (req, res) => {
@@ -471,12 +556,22 @@ router.get('/key-usage', (req, res) => {
 router.get('/resolve-handle', async (req, res) => {
     console.log('[API] Resolving handle:', req.query);
     const { handle } = req.query;
+    
     if (!handle) {
         console.log('[API] No handle provided');
         return res.status(400).json({ error: 'Handle is required' });
     }
+    
+    // SECURITY: Validate handle format to prevent SSRF attacks
+    const cleanHandle = handle.replace('@', '').trim();
+    if (!/^[a-zA-Z0-9_-]{1,100}$/.test(cleanHandle)) {
+        return res.status(400).json({ 
+            error: 'Invalid handle format',
+            details: 'Handle must contain only letters, numbers, underscores, and hyphens'
+        });
+    }
 
-    const url = `https://www.youtube.com/@${handle}`;
+    const url = `https://www.youtube.com/@${cleanHandle}`;
     console.log('[API] Fetching URL:', url);
 
     try {
@@ -494,7 +589,18 @@ router.get('/resolve-handle', async (req, res) => {
             }
 
             let data = '';
+            let dataSize = 0;
+            const MAX_RESPONSE_SIZE = 5 * 1024 * 1024; // 5MB limit
+            
             response.on('data', (chunk) => {
+                dataSize += chunk.length;
+                
+                // Prevent memory exhaustion from large responses
+                if (dataSize > MAX_RESPONSE_SIZE) {
+                    request.destroy();
+                    return res.status(413).json({ error: 'Response too large' });
+                }
+                
                 data += chunk;
             });
 

@@ -3,6 +3,7 @@ import { formatFullDate, formatViewCount, normalizeVideoObject } from '../utils.
 
 // This keeps track of the currently playing YouTube video so we can manage it.
 let activePlayer = null;
+let activeEscapeHandler = null;
 
 // A helper to close the video popup. It stops the video and removes the overlay.
 function closeVideoOverlay(overlayId) {
@@ -13,9 +14,15 @@ function closeVideoOverlay(overlayId) {
         try {
             activePlayer.destroy();
         } catch (e) {
-            console.error('Error destroying player:', e);
+            console.error('[PLAYER] Error destroying player:', e);
         }
         activePlayer = null;
+    }
+    
+    // MEMORY LEAK FIX: Always remove escape handler
+    if (activeEscapeHandler) {
+        document.removeEventListener('keydown', activeEscapeHandler);
+        activeEscapeHandler = null;
     }
     
     overlay.remove();
@@ -86,12 +93,13 @@ export function displayVideos(videosToDisplay) {
                 }
             });
 
+            // MEMORY LEAK FIX: Store handler reference for proper cleanup
             const handleEscape = (e) => {
                 if (e.key === 'Escape') {
                     closeVideoOverlay(overlayId);
-                    document.removeEventListener('keydown', handleEscape);
                 }
             };
+            activeEscapeHandler = handleEscape;
             document.addEventListener('keydown', handleEscape);
 
             activePlayer = new YT.Player(`player-${video.id}`, {

@@ -5,7 +5,8 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import cors from 'cors';
-import apiRoutes from './routes/api.js';
+import helmet from 'helmet';
+import apiRoutes, { closeDatabase } from './routes/api.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -13,15 +14,31 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Security middleware
+app.use(helmet({
+    contentSecurityPolicy: false, // Disable for development, enable in production
+    crossOriginEmbedderPolicy: false
+}));
+
 // Debug middleware to log all requests
 app.use((req, res, next) => {
     console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
     next();
 });
 
+// Request timeout middleware (30 seconds)
+app.use((req, res, next) => {
+    req.setTimeout(30000, () => {
+        console.error('[TIMEOUT] Request timed out:', req.url);
+        res.status(408).json({ error: 'Request timeout' });
+    });
+    next();
+});
+
 app.use(cors());
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
+// SECURITY FIX: Reduced from 50MB to 10MB to prevent DoS
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
 app.use(express.static(path.join(__dirname, '../public')));
 
 // Mount API routes with debug logging
@@ -29,9 +46,23 @@ console.log('Mounting API routes...');
 app.use('/api', apiRoutes);
 console.log('API routes mounted');
 
+// Enhanced error handling middleware
 app.use((err, req, res, next) => {
-    console.error('Error:', err.stack);
-    res.status(500).send('Something broke!');
+    console.error('[ERROR]', {
+        message: err.message,
+        stack: err.stack,
+        url: req.url,
+        method: req.method,
+        timestamp: new Date().toISOString()
+    });
+    
+    // Don't leak error details in production
+    const isDev = process.env.NODE_ENV !== 'production';
+    res.status(err.status || 500).json({
+        error: 'Internal server error',
+        message: isDev ? err.message : 'Something went wrong',
+        ...(isDev && { stack: err.stack })
+    });
 });
 
 app.get('/', (req, res) => {
@@ -60,6 +91,51 @@ app._router.stack.forEach(middleware => {
     }
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
     console.log(`\nServer is running on http://localhost:${PORT}`);
-}); 
+    console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+});
+
+// Graceful shutdown handlers
+const gracefulShutdown = async (signal) => {
+    console.log(`\n${signal} received. Starting graceful shutdown...`);
+    
+    // Stop accepting new connections
+    server.close(async () => {
+        console.log('[SHUTDOWN] HTTP server closed');
+        
+        try {
+            // Close database connection
+            await closeDatabase();
+            console.log('[SHUTDOWN] All connections closed successfully');
+            process.exit(0);
+        } catch (error) {
+            console.error('[SHUTDOWN] Error during shutdown:', error);
+            process.exit(1);
+        }
+    });
+    
+    // Force shutdown after 10 seconds
+    setTimeout(() => {
+        console.error('[SHUTDOWN] Forced shutdown after timeout');
+        process.exit(1);
+    }, 10000);
+};
+
+// Listen for termination signals
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (error) => {
+    console.error('[FATAL] Uncaught Exception:', error);
+    gracefulShutdown('UNCAUGHT_EXCEPTION');
+});
+
+// Handle unhandled promise rejections
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('[FATAL] Unhandled Rejection at:', promise, 'reason:', reason);
+    gracefulShutdown('UNHANDLED_REJECTION');
+});
+
+export default server; 

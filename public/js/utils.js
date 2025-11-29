@@ -64,6 +64,25 @@ export function formatFullDate(date) {
     });
 }
 
+// SECURITY: Escape HTML to prevent XSS attacks
+export function escapeHtml(text) {
+    if (!text) return '';
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+// Sanitize URL to prevent javascript: protocol injection
+export function sanitizeUrl(url) {
+    if (!url) return '';
+    const urlStr = String(url).trim();
+    // Block javascript: and data: protocols
+    if (urlStr.match(/^(javascript|data|vbscript):/i)) {
+        return '';
+    }
+    return urlStr;
+}
+
 export function normalizeVideoObject(video) {
     if (!video) return null;
 
@@ -80,10 +99,10 @@ export function normalizeVideoObject(video) {
 
     return {
         id: id,
-        title: video.title || video.snippet?.title || 'Untitled Video',
-        thumbnail: thumbnail,
+        title: escapeHtml(video.title || video.snippet?.title || 'Untitled Video'),
+        thumbnail: sanitizeUrl(thumbnail),
         publishedAt: new Date(video.publishedAt || video.snippet?.publishedAt || Date.now()),
         viewCount: parseInt(video.viewCount || video.statistics?.viewCount || '0', 10),
         isStream: isStreamVideo(video)
     };
-} 
+}

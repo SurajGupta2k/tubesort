@@ -38,7 +38,9 @@ export async function loadContent() {
 
     } catch (error) {
         console.error('Error loading content:', error);
-        alert(error.message || 'An unexpected error occurred.');
+        if (window.toast) {
+            window.toast.error(error.message || 'An unexpected error occurred.');
+        }
         updateLoadingStatus(null);
     }
 }
@@ -113,7 +115,9 @@ export function filterAndDisplayByDate(clear = false) {
         const endDate = document.getElementById('end-date').value;
         
         if (startDate && endDate && new Date(startDate) > new Date(endDate)) {
-            alert('Start date cannot be after the end date.');
+            if (window.toast) {
+                window.toast.warning('Start date cannot be after the end date.');
+            }
             return;
         }
 

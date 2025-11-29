@@ -10,6 +10,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         console.log('Application initialized successfully.');
     } catch (error) {
         console.error('Failed to initialize the application:', error);
-        alert(`Failed to initialize the application: ${error.message}. Please try refreshing the page.`);
+        if (window.toast) {
+            window.toast.error(`Failed to initialize: ${error.message}. Please refresh the page.`);
+        }
     }
 }); 
