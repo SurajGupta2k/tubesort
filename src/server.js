@@ -41,6 +41,11 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 app.use(express.static(path.join(__dirname, '../public')));
 
+// Simple test route
+app.get('/test', (req, res) => {
+    res.json({ message: 'Server is working!', timestamp: new Date() });
+});
+
 // Mount API routes with debug logging
 console.log('Mounting API routes...');
 app.use('/api', apiRoutes);

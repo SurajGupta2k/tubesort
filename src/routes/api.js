@@ -24,6 +24,15 @@ const DB_CONFIG = {
 
 const router = express.Router();
 
+// Simple health check route that doesn't require database
+router.get('/health', (req, res) => {
+    res.json({ 
+        status: 'ok', 
+        timestamp: new Date().toISOString(),
+        environment: process.env.NODE_ENV || 'development'
+    });
+});
+
 // Mutex for thread-safe key rotation
 let keyRotationLock = false;
 
@@ -115,20 +124,29 @@ async function connectToDatabase() {
             try {
                 if (!client) {
                     client = new MongoClient(process.env.MONGODB_URI, {
-                        serverSelectionTimeoutMS: 5000,
-                        socketTimeoutMS: 45000,
+                        serverSelectionTimeoutMS: 3000, // Reduced for serverless
+                        socketTimeoutMS: 5000, // Reduced for serverless
+                        connectTimeoutMS: 3000, // Added for faster connection
+                        maxPoolSize: 1, // Minimal pool for serverless
+                        retryWrites: true,
+                        w: 'majority'
                     });
                 }
                 
                 await client.connect();
                 db = client.db(DB_CONFIG.dbName);
                 
-                // Test the connection
-                await db.command({ ping: 1 });
+                // Quick ping test with timeout
+                const pingPromise = db.command({ ping: 1 });
+                const timeoutPromise = new Promise((_, reject) => 
+                    setTimeout(() => reject(new Error('MongoDB ping timeout')), 2000)
+                );
+                
+                await Promise.race([pingPromise, timeoutPromise]);
                 console.log('Successfully connected to MongoDB and database is ready.');
                 
-                // Create indexes for performance
-                await createIndexes();
+                // Skip index creation in serverless to save time
+                // Indexes should be created manually in MongoDB Atlas
                 resolve();
             } catch (error) {
                 console.error('Failed to connect to MongoDB:', error);
